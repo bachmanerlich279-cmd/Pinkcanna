@@ -14,20 +14,21 @@ bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- ТОВАРИ ---
+# Оновлено ціни та додано назви файлів зображень
 PRODUCTS = {
-    "sleep": {"name": "Happy caps sleep 💤", "price": 400},
-    "gaba": {"name": "Габа #9 🧠", "price": 450},
-    "energy": {"name": "Happy caps energy ⚡", "price": 350},
-    "cream": {"name": "СБД Крем 🧴", "price": 600},
-    "vape": {"name": "Вейп 💨", "price": 850},
-    "jelly": {"name": "СБД Желе 🍬", "price": 500}
+    "sleep": {"name": "Happy caps sleep (Інгалятор) 💤", "price": 2000, "image": "sleep.jpg"},
+    "gaba": {"name": "Габа #9 🧠", "price": 400, "image": "gaba9.jpg"},
+    "energy": {"name": "Happy caps energy ⚡", "price": 2000, "image": "energy.jpg"},
+    "cream": {"name": "СБД Крем 🧴", "price": 1600, "image": "cream.jpg"},
+    "vape": {"name": "Вейп 💨", "price": 3000, "image": "blackvape.jpg"},
+    "jelly": {"name": "СБД Желе 🍬", "price": 1900, "image": "Cbdgele.jpg"}
 }
 
 user_carts = {}
 user_tapped_discounts = {}
 
 number_words = {
-    "одну":1, "один":1, "дві":2, "два":2, "три":3, "чотири":4, "п’ять":5, "шість":6
+    "одну": 1, "один": 1, "дві": 2, "два": 2, "три": 3, "чотири": 4, "п’ять": 5, "шість": 6
 }
 
 # --- ГОЛОВНЕ МЕНЮ ---
@@ -35,57 +36,70 @@ def main_menu():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.add("📂 Каталог", "🛒 Кошик")
     m.add(types.KeyboardButton("🍀 Натапати знижку", web_app=types.WebAppInfo(url=WEB_APP_URL)))
-    m.add("📞 Консультант")
+    m.add("📞 Консультант", "📰 Новини")
     return m
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, "🌿 Вітаємо у Pink Canna! Натапай собі знижку!", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "🌿 Вітаємо у Pink Canna! Обирай якісний CBD.", reply_markup=main_menu())
 
-@bot.message_handler(content_types=['web_app_data'])
-def handle_tap_result(message):
-    try:
-        coins = int(message.web_app_data.data)
-        discount_uah = round(coins / 10000, 2)
-        user_tapped_discounts[message.chat.id] = discount_uah
-        bot.send_message(message.chat.id, f"✅ Успішно! Твої {coins} коїнів конвертовано.\n"
-                                          f"💰 Знижка **{discount_uah} грн** активована для твого наступного замовлення!")
-    except:
-        bot.send_message(message.chat.id, "⚠️ Сталася помилка при отриманні коїнів.")
+# --- РОЗДІЛ НОВИНИ ---
+@bot.message_handler(func=lambda m: m.text == "📰 Новини")
+def news_section(message):
+    text = (
+        "🌿 **Що таке CBD?**\n\n"
+        "CBD (Каннабідіол) — це натуральний екстракт конопель, який допомагає організму долати стрес, "
+        "біль та безсоння. Він **не є психоактивним**, тому не викликає відчуття «кайфу».\n\n"
+        "⚖️ **Чому це легально?**\n\n"
+        "В Україні ізолят CBD виключений зі списку наркотичних речовин згідно з **Постановою КМУ №324**. "
+        "Наші продукти легальні, сертифіковані та безпечні для використання."
+    )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-# --- КАТАЛОГ ---
+# --- КАТАЛОГ З ФОТО ---
 @bot.message_handler(func=lambda m: m.text == "📂 Каталог")
 def catalog(message):
-    markup = types.InlineKeyboardMarkup()
+    bot.send_message(message.chat.id, "⬇️ Натисніть кнопку під фото, щоб замовити:")
     for key, item in PRODUCTS.items():
-        markup.add(types.InlineKeyboardButton(f"{item['name']} - {item['price']} грн", callback_data=f"buy_{key}_1"))
-    bot.send_message(message.chat.id, "📦 Що бажаєте замовити?", reply_markup=markup)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(f"➕ Купити за {item['price']} грн", callback_data=f"buy_{key}_1"))
+        
+        caption = f"🏷 **{item['name']}**\n💰 Ціна: {item['price']} грн"
+        
+        try:
+            if os.path.exists(item['image']):
+                with open(item['image'], 'rb') as photo:
+                    bot.send_photo(message.chat.id, photo, caption=caption, reply_markup=markup, parse_mode="Markdown")
+            else:
+                bot.send_message(message.chat.id, caption, reply_markup=markup, parse_mode="Markdown")
+        except Exception:
+            bot.send_message(message.chat.id, caption, reply_markup=markup, parse_mode="Markdown")
 
+# --- КОШИК ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_"))
 def add_to_cart(call):
     parts = call.data.split("_")
     key = parts[1]
-    count = int(parts[2]) if len(parts) > 2 else 1
+    count = int(parts[2])
     user_carts.setdefault(call.message.chat.id, []).extend([key]*count)
-    bot.answer_callback_query(call.id, f"✅ Додано {count} {PRODUCTS[key]['name']} у кошик")
+    bot.answer_callback_query(call.id, f"✅ Додано: {PRODUCTS[key]['name']}")
 
-# --- КОШИК ---
 @bot.message_handler(func=lambda m: m.text == "🛒 Кошик")
 def show_cart(message):
     chat_id = message.chat.id
     if chat_id not in user_carts or not user_carts[chat_id]:
-        bot.send_message(chat_id, "🛒 Кошик порожній. Час щось натапати! 🍀")
+        bot.send_message(chat_id, "🛒 Кошик порожній.")
         return
 
     items = user_carts[chat_id]
     total = sum(PRODUCTS[k]['price'] for k in items)
     
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💳 Оформити замовлення", callback_data="checkout"))
+    markup.add(types.InlineKeyboardButton("💳 Оформити", callback_data="checkout"))
     markup.add(types.InlineKeyboardButton("🗑 Очистити", callback_data="clear_cart"))
     
-    summary = "\n".join([f"{PRODUCTS[k]['name']} x{items.count(k)}" for k in set(items)])
-    bot.send_message(chat_id, f"Твій кошик:\n- {summary}\n\n💰 Сума: {total} грн", reply_markup=markup)
+    summary = "\n".join([f"• {PRODUCTS[k]['name']} x{items.count(k)}" for k in set(items)])
+    bot.send_message(chat_id, f"**Твій кошик:**\n{summary}\n\n💰 **Разом: {total} грн**", reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data == "clear_cart")
 def clear(call):
@@ -96,7 +110,7 @@ def clear(call):
 def checkout(call):
     send_invoice(call.message.chat.id)
 
-# --- ФІНАЛЬНИЙ РАХУНОК ---
+# --- ОПЛАТА ---
 def send_invoice(chat_id):
     items = user_carts.get(chat_id, [])
     prices = []
@@ -111,7 +125,7 @@ def send_invoice(chat_id):
     discount = user_tapped_discounts.get(chat_id, 0)
     if discount > 0:
         if discount >= total_price: discount = total_price - 1
-        prices.append(types.LabeledPrice("🍀 Знижка з гри", -int(discount * 100)))
+        prices.append(types.LabeledPrice("🍀 Знижка", -int(discount * 100)))
 
     bot.send_invoice(
         chat_id, title="Pink Canna", description="Оплата замовлення",
@@ -126,58 +140,28 @@ def pre_checkout(q):
 
 @bot.message_handler(content_types=['successful_payment'])
 def success(message):
-    bot.send_message(message.chat.id, "✅ Оплата пройшла успішно! Чекайте на доставку.")
+    bot.send_message(message.chat.id, "✅ Дякуємо! Замовлення прийнято.")
     user_carts[message.chat.id] = []
-    user_tapped_discounts[message.chat.id] = 0
 
 # --- AI-КОНСУЛЬТАНТ ---
 @bot.message_handler(func=lambda m: True)
 def ai_consultant(message):
-    if message.text in ["📂 Каталог", "🛒 Кошик", "📞 Консультант", "🍀 Натапати знижку"]:
+    if message.text in ["📂 Каталог", "🛒 Кошик", "📞 Консультант", "🍀 Натапати знижку", "📰 Новини"]:
         return
 
     try:
-        # Підготовка опису товарів
         catalog_text = ", ".join([f"{p['name']} ({p['price']} грн)" for p in PRODUCTS.values()])
-        
-        # Виклик GPT для консультації
+        # Змінено модель на gpt-4o, бо gpt-5 ще не існує
         response = client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-4o",
             messages=[
-                {"role": "system", "content": f"Ти продавець-консультант. Продавай товари з каталогу: {catalog_text}. "
-                                               "Пропонуй підбір, cross-sell, upsell, питай кількість і уточнюй бажання клієнта."},
+                {"role": "system", "content": f"Ти консультант Pink Canna. Продавай: {catalog_text}. На питання про легальність відповідай: легально згідно з Постановою КМУ №324."},
                 {"role": "user", "content": message.text}
             ]
         )
-
-        ai_text = response.choices[0].message.content
-
-        # Генеруємо кнопки замовлення за товарами з тексту
-        markup = types.InlineKeyboardMarkup()
-        text_lower = message.text.lower()
-        added_any = False
-        for key, item in PRODUCTS.items():
-            if re.search(re.escape(item['name'].split()[0].lower()), text_lower):
-                count = 1
-                for word, num in number_words.items():
-                    if word in text_lower:
-                        count = num
-                        break
-                markup.add(types.InlineKeyboardButton(
-                    f"➕ Додати {item['name']} x{count} ({item['price']} грн)", 
-                    callback_data=f"buy_{key}_{count}"
-                ))
-                added_any = True
-
-        # Відповідь бота
-        if added_any:
-            bot.send_message(message.chat.id, ai_text, reply_markup=markup)
-        else:
-            bot.send_message(message.chat.id, ai_text)
-
-    except Exception as e:
-        print(e)
-        bot.send_message(message.chat.id, "⚠️ Консультант тимчасово не доступний")
+        bot.send_message(message.chat.id, response.choices[0].message.content)
+    except Exception:
+        bot.send_message(message.chat.id, "⚠️ Консультант тимчасово недоступний.")
 
 if __name__ == "__main__":
     bot.infinity_polling()

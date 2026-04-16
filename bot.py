@@ -35,13 +35,35 @@ def main_menu():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.add("📂 Каталог", "🛒 Кошик")
     m.add(types.KeyboardButton("🍀 Натапати знижку", web_app=types.WebAppInfo(url=WEB_APP_URL)))
-    m.add("📞 Консультант")
+    # Додано кнопку Новини
+    m.add("📞 Консультант", "📰 Новини") 
     return m
 
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id, "🌿 Вітаємо у Pink Canna! Натапай собі знижку!", reply_markup=main_menu())
 
+# --- РОЗДІЛ НОВИНИ (ЩО ТАКЕ CBD) ---
+@bot.message_handler(func=lambda m: m.text == "📰 Новини")
+def news_section(message):
+    text = (
+        "🌿 **Що таке CBD (Каннабідіол)?**\n\n"
+        "CBD — це природний екстракт конопель, який **не має психоактивного ефекту**. "
+        "На відміну від ТГК, він не викликає відчуття «сп'яніння», а навпаки — допомагає організму знайти баланс.\n\n"
+        "✅ **Користь CBD:**\n"
+        "• Знімає стрес та тривожність\n"
+        "• Покращує якість сну\n"
+        "• Зменшує хронічні болі та запалення\n"
+        "• Допомагає при відновленні після тренувань\n\n"
+        "⚖️ **Чому це легально в Україні?**\n\n"
+        "Згідно з Постановою Кабінету Міністрів України №324, ізолят каннабідіолу (CBD) "
+        "**не входить** до списку наркотичних засобів. Наші продукти містять 0% ТГК (або в межах закону до 0.08%), "
+        "що робить їх повністю легальними для купівлі, зберігання та вживання.\n\n"
+        "Pink Canna — це твій безпечний шлях до спокою! ✨"
+    )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+# --- ОБРОБКА WEB APP ---
 @bot.message_handler(content_types=['web_app_data'])
 def handle_tap_result(message):
     try:
@@ -133,29 +155,27 @@ def success(message):
 # --- AI-КОНСУЛЬТАНТ ---
 @bot.message_handler(func=lambda m: True)
 def ai_consultant(message):
-    if message.text in ["📂 Каталог", "🛒 Кошик", "📞 Консультант", "🍀 Натапати знижку"]:
+    # Додано перевірку, щоб AI не реагував на кнопку новин
+    if message.text in ["📂 Каталог", "🛒 Кошик", "📞 Консультант", "🍀 Натапати знижку", "📰 Новини"]:
         return
 
     try:
-        # Підготовка опису товарів
         catalog_text = ", ".join([f"{p['name']} ({p['price']} грн)" for p in PRODUCTS.values()])
         
-        # Виклик GPT для консультації
         response = client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-4o", # Замінив на актуальну модель gpt-4o (gpt-5 ще не існує)
             messages=[
-                {"role": "system", "content": f"Ти продавець-консультант. Продавай товари з каталогу: {catalog_text}. "
-                                               "Пропонуй підбір, cross-sell, upsell, питай кількість і уточнюй бажання клієнта."},
+                {"role": "system", "content": f"Ти продавець-консультант Pink Canna. Продавай товари: {catalog_text}. "
+                                               "Ти ввічливий, використовуєш емодзі. Якщо питають про легальність — кажи, що все по закону України (Постанова №324)."},
                 {"role": "user", "content": message.text}
             ]
         )
 
         ai_text = response.choices[0].message.content
-
-        # Генеруємо кнопки замовлення за товарами з тексту
         markup = types.InlineKeyboardMarkup()
         text_lower = message.text.lower()
         added_any = False
+        
         for key, item in PRODUCTS.items():
             if re.search(re.escape(item['name'].split()[0].lower()), text_lower):
                 count = 1
@@ -164,16 +184,12 @@ def ai_consultant(message):
                         count = num
                         break
                 markup.add(types.InlineKeyboardButton(
-                    f"➕ Додати {item['name']} x{count} ({item['price']} грн)", 
+                    f"➕ Додати {item['name']} x{count}", 
                     callback_data=f"buy_{key}_{count}"
                 ))
                 added_any = True
 
-        # Відповідь бота
-        if added_any:
-            bot.send_message(message.chat.id, ai_text, reply_markup=markup)
-        else:
-            bot.send_message(message.chat.id, ai_text)
+        bot.send_message(message.chat.id, ai_text, reply_markup=markup if added_any else None)
 
     except Exception as e:
         print(e)

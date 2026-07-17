@@ -3,6 +3,9 @@ from telebot import types
 import os
 import sqlite3
 import re
+import math
+import struct
+import zlib
 import requests
 from io import BytesIO
 from datetime import datetime, timedelta
@@ -18,6 +21,7 @@ PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = os.getenv("ADMIN_ID") 
 WEB_APP_URL = "https://mamutpetr.github.io/Pinkcanna/"
+PRODUCT_IMAGE_PLACEHOLDER = "placeholder.png"
 
 # --- POSTER API ---
 POSTER_TOKEN = os.getenv("POSTER_TOKEN")
@@ -32,6 +36,33 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 user_data_cache = {}
 
 # --- UTILS ---
+def ensure_placeholder_image():
+    """Create a dependency-free local placeholder when it is not deployed."""
+    if os.path.exists(PRODUCT_IMAGE_PLACEHOLDER):
+        return
+
+    def png_chunk(chunk_type, data):
+        body = chunk_type + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+
+    try:
+        width, height = 640, 360
+        # A neutral Pink Canna-colored card; solid rows compress to a tiny file.
+        scanline = b"\x00" + bytes((244, 194, 213)) * width
+        raw_pixels = scanline * height
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(raw_pixels, 9))
+            + png_chunk(b"IEND", b"")
+        )
+        with open(PRODUCT_IMAGE_PLACEHOLDER, "wb") as placeholder_file:
+            placeholder_file.write(png)
+    except OSError as e:
+        # Product cards already have a safe text-only fallback if the working
+        # directory is read-only.
+        print("⚠️ PLACEHOLDER IMAGE:", e)
+
 def normalize_phone(phone):
     clean = re.sub(r'\D', '', phone)
     if clean.startswith("380"): return clean
@@ -151,6 +182,19 @@ def init_db():
                      (product_key TEXT PRIMARY KEY, total_qty INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS orders 
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, items TEXT, total REAL, poster_order_id INTEGER, status TEXT DEFAULT 'active', product_keys TEXT, created_at DATETIME)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS categories (
+                     cat_id TEXT PRIMARY KEY,
+                     name TEXT NOT NULL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS products (
+                     product_key TEXT PRIMARY KEY,
+                     poster_id INTEGER DEFAULT 0,
+                     name TEXT NOT NULL,
+                     price REAL NOT NULL,
+                     image TEXT,
+                     category TEXT,
+                     short TEXT,
+                     info TEXT,
+                     FOREIGN KEY(category) REFERENCES categories(cat_id))''')
         
         try: c.execute("ALTER TABLE users ADD COLUMN phone TEXT")
         except: pass
@@ -162,9 +206,77 @@ def init_db():
         try: c.execute("ALTER TABLE orders ADD COLUMN product_keys TEXT")
         except: pass
 
-        for key in PRODUCTS.keys():
-            c.execute("INSERT OR IGNORE INTO inventory (product_key, total_qty) VALUES (?, 20)", (key,))
+        # One-time migration from the catalog that used to live only in Python.
+        # Existing database rows always win, so upgrades never overwrite admin data.
+        c.execute("SELECT COUNT(*) FROM categories")
+        if c.fetchone()[0] == 0:
+            c.executemany(
+                "INSERT INTO categories (cat_id, name) VALUES (?, ?)",
+                DEFAULT_CATEGORIES.items()
+            )
+
+        c.execute("SELECT COUNT(*) FROM products")
+        if c.fetchone()[0] == 0:
+            # Ensure all seed categories exist even if a partially initialized
+            # database already had one or more custom categories.
+            c.executemany(
+                "INSERT OR IGNORE INTO categories (cat_id, name) VALUES (?, ?)",
+                DEFAULT_CATEGORIES.items()
+            )
+            c.executemany(
+                '''INSERT INTO products
+                   (product_key, poster_id, name, price, image, category, short, info)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                [
+                    (
+                        key,
+                        item.get("poster_id", 0),
+                        item["name"],
+                        item["price"],
+                        item.get("image"),
+                        item.get("category"),
+                        item.get("short", ""),
+                        item.get("info", "")
+                    )
+                    for key, item in DEFAULT_PRODUCTS.items()
+                ]
+            )
+
+        c.execute("SELECT product_key FROM products")
+        for (key,) in c.fetchall():
+            c.execute(
+                "INSERT OR IGNORE INTO inventory (product_key, total_qty) VALUES (?, 20)",
+                (key,)
+            )
         conn.commit()
+
+def load_products_from_db():
+    """Reload the database catalog into the legacy in-memory dictionaries."""
+    global CATEGORIES, PRODUCTS
+    with sqlite3.connect("pinkcanna.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT cat_id, name FROM categories ORDER BY rowid")
+        categories = dict(c.fetchall())
+        c.execute('''SELECT product_key, poster_id, name, price, image,
+                            category, short, info
+                     FROM products ORDER BY rowid''')
+        products = {
+            row[0]: {
+                "poster_id": row[1] or 0,
+                "name": row[2],
+                "price": row[3],
+                "image": row[4] or "",
+                "category": row[5],
+                "short": row[6] or "",
+                "info": row[7] or ""
+            }
+            for row in c.fetchall()
+        }
+
+    # Replace both objects together only after the reads succeed. Handlers never
+    # see a half-loaded catalog, even if SQLite raises an exception.
+    CATEGORIES = categories
+    PRODUCTS = products
 
 def db_cleanup_expired():
     with sqlite3.connect("pinkcanna.db") as conn:
@@ -187,7 +299,11 @@ def db_get_stock(product_key):
 def db_set_stock(product_key, qty):
     with sqlite3.connect("pinkcanna.db") as conn:
         c = conn.cursor()
-        c.execute("UPDATE inventory SET total_qty = ? WHERE product_key = ?", (qty, product_key))
+        c.execute(
+            '''INSERT INTO inventory (product_key, total_qty) VALUES (?, ?)
+               ON CONFLICT(product_key) DO UPDATE SET total_qty = excluded.total_qty''',
+            (product_key, qty)
+        )
         conn.commit()
 
 def db_add_to_cart_with_reserve(user_id, product_key):
@@ -258,7 +374,7 @@ def db_manage_history(user_id, role=None, content=None):
         return [{"role": row[0], "content": row[1]} for row in c.fetchall()]
 
 # --- ТОВАРИ ---
-CATEGORIES = {
+DEFAULT_CATEGORIES = {
     "kanna": "🌿 Екстракти Канни", 
     "cbd": "💧 Олії та Релакс", 
     "wellness": "🧠 Сон та Енергія", 
@@ -268,7 +384,7 @@ CATEGORIES = {
     "cocktails": "🍸 Коктейлі"
 }
 
-PRODUCTS = {
+DEFAULT_PRODUCTS = {
     "espresso": {"poster_id": 10, "name": "Еспресо", "price": 65, "image": "espresso.jpg", "category": "coffee", "short": "Класична бадьорість.", "info": "☕️ **Еспресо:** Міцна, насичена кава зі 100% арабіки для ідеального початку дня."},
     "cappuccino": {"poster_id": 9, "name": "Капучино", "price": 85, "image": "cappuccino.jpg", "category": "coffee", "short": "Ніжна молочна пінка.", "info": "☕️ **Капучино:** Ідеальний баланс еспресо та збитого в ніжну пінку молока."},
     "latte": {"poster_id": 8, "name": "Лате", "price": 90, "image": "latte.jpg", "category": "coffee", "short": "Більше молока, м'який смак.", "info": "☕️ **Лате:** Легкий кавовий напій для тих, хто полюбляє м'який молочний смак."},
@@ -298,6 +414,11 @@ PRODUCTS = {
     "cream": {"poster_id": 139, "name": "СБД Крем", "price": 1600, "image": "cream.jpg", "category": "topical", "short": "Для м'язів.", "info": "🧴 **Cream:** Локальне зняття болю та запалень."}
 }
 
+# Runtime catalog. init_db() seeds/migrates the defaults above and then these
+# dictionaries are populated exclusively from SQLite.
+CATEGORIES = {}
+PRODUCTS = {}
+
 DOSAGE_DATA = {
     "ptsd_insomnia": {"name": "ПТСР / Безсоння / Артрит", "doses": {50: 78, 60: 85, 70: 93, 80: 100, 90: 108, 100: 115, 110: 123, 120: 130}},
     "pain": {"name": "Хронічний біль", "doses": {50: 91, 60: 99, 70: 106, 80: 113, 90: 120, 100: 128, 110: 135, 120: 142}},
@@ -308,7 +429,9 @@ DOSAGE_DATA = {
 }
 CONC_DATA = {5: {"10ml": 35, "30ml": 50}, 10: {"10ml": 70, "30ml": 100}, 15: {"10ml": 105, "30ml": 150}, 20: {"10ml": 140, "30ml": 200}, 30: {"10ml": 210, "30ml": 300}}
 
+ensure_placeholder_image()
 init_db()
+load_products_from_db()
 
 # --- ВІДПРАВКА КАРТКИ ТОВАРУ ---
 def send_product_card(chat_id, key):
@@ -601,7 +724,7 @@ def show_cats(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cat_"))
 def show_items(call):
     bot.answer_callback_query(call.id)
-    cat_id = call.data.split("_")[1]
+    cat_id = call.data[len("cat_"):]
     for key, item in PRODUCTS.items():
         if item["category"] == cat_id: send_product_card(call.message.chat.id, key)
 
@@ -771,45 +894,494 @@ def start_checkout(call):
         except: pass
 
 # --- АДМІНКА ---
+def is_admin(user_id):
+    return ADMIN_ID is not None and str(user_id) == str(ADMIN_ID)
+
+def admin_menu_markup():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(
+        types.InlineKeyboardButton("📦 Склад", callback_data="admin_stock"),
+        types.InlineKeyboardButton("➕ Додати товар", callback_data="admin_add_product"),
+        types.InlineKeyboardButton("📢 Розсилка", callback_data="admin_broadcast")
+    )
+    return m
+
+def reject_non_admin_callback(call):
+    if is_admin(call.from_user.id):
+        return False
+    try:
+        bot.answer_callback_query(call.id, "⛔ Немає доступу", show_alert=True)
+    except Exception:
+        pass
+    return True
+
+def normalize_product_key(value):
+    value = re.sub(r"\s+", "_", (value or "").strip().lower())
+    value = re.sub(r"_+", "_", value).strip("_")
+    if not value or len(value) > 40 or not re.fullmatch(r"[a-z0-9_]+", value):
+        return None
+    return value
+
+def generate_category_id(name):
+    base = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+    if not base:
+        base = f"category_{int(time.time())}"
+    base = base[:32].rstrip("_") or "category"
+    candidate = base
+    suffix = 2
+    while candidate in CATEGORIES:
+        tail = f"_{suffix}"
+        candidate = f"{base[:32 - len(tail)]}{tail}"
+        suffix += 1
+    return candidate
+
+def category_picker_markup():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    for cat_id, cat_name in CATEGORIES.items():
+        m.add(types.InlineKeyboardButton(cat_name, callback_data=f"admin_add_cat:{cat_id}"))
+    m.add(types.InlineKeyboardButton("🆕 Створити нову категорію", callback_data="admin_add_category_new"))
+    return m
+
+def image_skip_markup():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("⏭ Використати placeholder", callback_data="admin_add_image_skip"))
+    return m
+
+def broadcast_preview_markup():
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(
+        types.InlineKeyboardButton("✅ Надіслати", callback_data="admin_broadcast_send"),
+        types.InlineKeyboardButton("❌ Скасувати", callback_data="admin_broadcast_cancel")
+    )
+    return m
+
+def prompt_admin_short(chat_id):
+    bot.send_message(chat_id, "Введіть короткий опис товару:")
+
+def prompt_admin_image(chat_id):
+    bot.send_message(
+        chat_id,
+        "Надішліть фото товару. Буде збережено фото найвищої доступної якості.",
+        reply_markup=image_skip_markup()
+    )
+
+def finish_admin_product(user_id, image_path=PRODUCT_IMAGE_PLACEHOLDER):
+    state = user_data_cache.get(user_id, {})
+    required = ("product_key", "name", "price", "category", "short", "info")
+    if state.get("step") != "admin_add_image" or any(field not in state for field in required):
+        bot.send_message(user_id, "⚠️ Дані товару неповні. Запустіть додавання ще раз через /admin.")
+        user_data_cache.pop(user_id, None)
+        return
+
+    try:
+        with sqlite3.connect("pinkcanna.db") as conn:
+            c = conn.cursor()
+            c.execute(
+                '''INSERT INTO products
+                   (product_key, poster_id, name, price, image, category, short, info)
+                   VALUES (?, 0, ?, ?, ?, ?, ?, ?)''',
+                (
+                    state["product_key"], state["name"], state["price"], image_path,
+                    state["category"], state["short"], state["info"]
+                )
+            )
+            c.execute(
+                '''INSERT INTO inventory (product_key, total_qty) VALUES (?, 20)
+                   ON CONFLICT(product_key) DO UPDATE SET total_qty = 20''',
+                (state["product_key"],)
+            )
+            conn.commit()
+        product_name = state["name"]
+        product_key = state["product_key"]
+        user_data_cache.pop(user_id, None)
+        load_products_from_db()
+        bot.send_message(
+            user_id,
+            f"✅ Товар «{product_name}» додано.\nКлюч: `{product_key}`\nПочатковий залишок: 20 шт.",
+            reply_markup=admin_menu_markup(),
+            parse_mode="Markdown"
+        )
+    except sqlite3.IntegrityError:
+        user_data_cache.pop(user_id, None)
+        bot.send_message(user_id, "⚠️ Товар із таким ключем уже існує.", reply_markup=admin_menu_markup())
+    except Exception as e:
+        print("❌ ADMIN ADD PRODUCT:", e)
+        bot.send_message(user_id, "⚠️ Не вдалося зберегти товар. Спробуйте ще раз або перевірте журнал помилок.")
+
+def show_broadcast_preview(user_id, draft):
+    state = user_data_cache.setdefault(user_id, {})
+    state["step"] = "admin_broadcast_preview"
+    state["broadcast"] = draft
+    bot.send_message(user_id, "👀 Попередній перегляд розсилки:")
+    if draft["type"] == "photo":
+        bot.send_photo(
+            user_id,
+            draft["file_id"],
+            caption=draft.get("caption"),
+            reply_markup=broadcast_preview_markup()
+        )
+    else:
+        bot.send_message(user_id, draft["text"], reply_markup=broadcast_preview_markup())
+
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
-    if str(message.chat.id) != str(ADMIN_ID): return
-    m = types.InlineKeyboardMarkup(row_width=1)
-    m.add(types.InlineKeyboardButton("📦 Склад", callback_data="admin_stock"), types.InlineKeyboardButton("📢 Розсилка", callback_data="admin_broadcast"))
-    bot.send_message(message.chat.id, "👨‍💻 **Адміністративна панель**", reply_markup=m, parse_mode="Markdown")
+    if not is_admin(message.chat.id):
+        return
+    user_data_cache.pop(message.chat.id, None)
+    bot.send_message(
+        message.chat.id,
+        "👨‍💻 **Адміністративна панель**",
+        reply_markup=admin_menu_markup(),
+        parse_mode="Markdown"
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_stock")
 def admin_stock_cats(call):
+    if reject_non_admin_callback(call):
+        return
+    user_data_cache.pop(call.from_user.id, None)
+    load_products_from_db()
     m = types.InlineKeyboardMarkup(row_width=1)
-    for cat_id, cat_name in CATEGORIES.items(): m.add(types.InlineKeyboardButton(cat_name, callback_data=f"astockcat_{cat_id}"))
+    for cat_id, cat_name in CATEGORIES.items():
+        m.add(types.InlineKeyboardButton(cat_name, callback_data=f"astockcat_{cat_id}"))
+    m.add(types.InlineKeyboardButton("⬅️ Адмін-панель", callback_data="admin_home"))
+    bot.answer_callback_query(call.id)
     bot.edit_message_text("📦 Категорія для складу:", call.message.chat.id, call.message.message_id, reply_markup=m)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("astockcat_"))
 def admin_stock_items(call):
-    cat_id = call.data.split("_")[1]
+    if reject_non_admin_callback(call):
+        return
+    cat_id = call.data[len("astockcat_"):]
     m = types.InlineKeyboardMarkup(row_width=1)
     for key, item in PRODUCTS.items():
-        if item["category"] == cat_id: m.add(types.InlineKeyboardButton(f"{item['name']} ({db_get_stock(key)} шт)", callback_data=f"astockedit_{key}"))
+        if item["category"] == cat_id:
+            m.add(types.InlineKeyboardButton(
+                f"{item['name']} ({db_get_stock(key)} шт)",
+                callback_data=f"astockedit_{key}"
+            ))
     m.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_stock"))
+    bot.answer_callback_query(call.id)
     bot.edit_message_text("📦 Зміна кількості:", call.message.chat.id, call.message.message_id, reply_markup=m)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("astockedit_"))
 def admin_stock_edit(call):
-    key = call.data.split("_")[1]
-    msg = bot.send_message(call.message.chat.id, f"Введіть кількість для **{PRODUCTS[key]['name']}**:")
-    bot.register_next_step_handler(msg, process_stock_update, key)
+    if reject_non_admin_callback(call):
+        return
+    key = call.data[len("astockedit_"):]
+    if key not in PRODUCTS:
+        bot.answer_callback_query(call.id, "Товар не знайдено", show_alert=True)
+        return
+    user_data_cache[call.from_user.id] = {"step": "admin_stock_qty", "product_key": key}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, f"Введіть кількість для **{PRODUCTS[key]['name']}**:", parse_mode="Markdown")
 
-def process_stock_update(message, key):
+@bot.callback_query_handler(func=lambda call: call.data == "admin_home")
+def admin_home(call):
+    if reject_non_admin_callback(call):
+        return
+    user_data_cache.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        "👨‍💻 **Адміністративна панель**",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=admin_menu_markup(),
+        parse_mode="Markdown"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_add_product")
+def admin_add_product(call):
+    if reject_non_admin_callback(call):
+        return
+    load_products_from_db()
+    user_data_cache[call.from_user.id] = {"step": "admin_add_key"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "Введіть унікальний англійський ключ товару (наприклад, `matcha_latte`).\n"
+        "Пробіли автоматично стануть символами підкреслення:",
+        parse_mode="Markdown"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_add_cat:"))
+def admin_add_category_selected(call):
+    if reject_non_admin_callback(call):
+        return
+    state = user_data_cache.get(call.from_user.id, {})
+    if state.get("step") != "admin_add_category":
+        bot.answer_callback_query(call.id, "Сесія додавання застаріла", show_alert=True)
+        return
+    cat_id = call.data.split(":", 1)[1]
+    if cat_id not in CATEGORIES:
+        bot.answer_callback_query(call.id, "Категорію не знайдено", show_alert=True)
+        return
+    state["category"] = cat_id
+    state["step"] = "admin_add_short"
+    bot.answer_callback_query(call.id)
+    prompt_admin_short(call.message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_add_category_new")
+def admin_add_category_new(call):
+    if reject_non_admin_callback(call):
+        return
+    state = user_data_cache.get(call.from_user.id, {})
+    if state.get("step") != "admin_add_category":
+        bot.answer_callback_query(call.id, "Сесія додавання застаріла", show_alert=True)
+        return
+    state["step"] = "admin_add_category_name"
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "Введіть публічну назву нової категорії:")
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_add_image_skip")
+def admin_add_image_skip(call):
+    if reject_non_admin_callback(call):
+        return
+    if user_data_cache.get(call.from_user.id, {}).get("step") != "admin_add_image":
+        bot.answer_callback_query(call.id, "Сесія додавання застаріла", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    finish_admin_product(call.from_user.id, PRODUCT_IMAGE_PLACEHOLDER)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast")
+def admin_broadcast_start(call):
+    if reject_non_admin_callback(call):
+        return
+    user_data_cache[call.from_user.id] = {"step": "admin_broadcast_content"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "📢 Надішліть текст або фото з підписом для розсилки:")
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast_cancel")
+def admin_broadcast_cancel(call):
+    if reject_non_admin_callback(call):
+        return
+    user_data_cache.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id, "Розсилку скасовано")
+    bot.send_message(call.message.chat.id, "❌ Розсилку скасовано.", reply_markup=admin_menu_markup())
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_broadcast_send")
+def admin_broadcast_send(call):
+    if reject_non_admin_callback(call):
+        return
+    state = user_data_cache.get(call.from_user.id, {})
+    draft = state.get("broadcast")
+    if state.get("step") != "admin_broadcast_preview" or not draft:
+        bot.answer_callback_query(call.id, "Чернетку не знайдено", show_alert=True)
+        return
+
+    # Prevent a double tap from launching the same broadcast twice.
+    state["step"] = "admin_broadcast_sending"
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "⏳ Розсилку розпочато…")
     try:
-        qty = int(message.text); db_set_stock(key, qty)
-        bot.send_message(message.chat.id, f"✅ Успішно оновлено: {qty} шт.")
-    except: bot.send_message(message.chat.id, "⚠️ Помилка: використовуйте лише цифри.")
+        with sqlite3.connect("pinkcanna.db") as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM users")
+            user_ids = [row[0] for row in c.fetchall()]
+    except sqlite3.Error as e:
+        print("❌ BROADCAST DATABASE:", e)
+        user_data_cache.pop(call.from_user.id, None)
+        bot.send_message(call.message.chat.id, "⚠️ Не вдалося отримати список користувачів.", reply_markup=admin_menu_markup())
+        return
+
+    sent = 0
+    failed = 0
+    for user_id in user_ids:
+        try:
+            if draft["type"] == "photo":
+                bot.send_photo(user_id, draft["file_id"], caption=draft.get("caption"))
+            else:
+                bot.send_message(user_id, draft["text"])
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print(f"⚠️ BROADCAST FAILED [{user_id}]:", e)
+        finally:
+            time.sleep(0.05)
+
+    user_data_cache.pop(call.from_user.id, None)
+    bot.send_message(
+        call.message.chat.id,
+        f"📊 Розсилку завершено.\nSuccessfully sent: {sent}. Blocked/Failed: {failed}.",
+        reply_markup=admin_menu_markup()
+    )
+
+@bot.message_handler(
+    content_types=['photo'],
+    func=lambda message: is_admin(message.chat.id) and
+    user_data_cache.get(message.chat.id, {}).get("step") in
+    ("admin_add_image", "admin_broadcast_content")
+)
+def admin_photo_input(message):
+    state = user_data_cache.get(message.chat.id, {})
+    if state.get("step") == "admin_broadcast_content":
+        show_broadcast_preview(message.chat.id, {
+            "type": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": message.caption or ""
+        })
+        return
+
+    key = state.get("product_key")
+    if not key:
+        user_data_cache.pop(message.chat.id, None)
+        bot.send_message(message.chat.id, "⚠️ Сесія додавання пошкоджена. Почніть ще раз через /admin.")
+        return
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        image_path = f"{key}.jpg"
+        with open(image_path, "wb") as image_file:
+            image_file.write(downloaded_file)
+        finish_admin_product(message.chat.id, image_path)
+    except Exception as e:
+        print("❌ ADMIN IMAGE DOWNLOAD:", e)
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Не вдалося завантажити фото. Надішліть його ще раз або пропустіть цей крок.",
+            reply_markup=image_skip_markup()
+        )
+
+def handle_admin_text_input(message):
+    user_id = message.chat.id
+    state = user_data_cache.get(user_id, {})
+    step = state.get("step", "")
+    if not step.startswith("admin_"):
+        return False
+    if not is_admin(user_id):
+        user_data_cache.pop(user_id, None)
+        return False
+
+    text = (message.text or "").strip()
+
+    if step == "admin_add_key":
+        key = normalize_product_key(text)
+        if not key:
+            bot.send_message(
+                user_id,
+                "⚠️ Використовуйте лише англійські літери, цифри та пробіли/підкреслення (до 40 символів). Спробуйте ще раз:"
+            )
+            return True
+        if key in PRODUCTS:
+            bot.send_message(user_id, "⚠️ Такий ключ уже існує. Введіть інший:")
+            return True
+        state["product_key"] = key
+        state["step"] = "admin_add_name"
+        bot.send_message(user_id, f"Ключ буде збережено як `{key}`.\nВведіть публічну назву товару:", parse_mode="Markdown")
+        return True
+
+    if step == "admin_add_name":
+        if not text:
+            bot.send_message(user_id, "⚠️ Назва не може бути порожньою. Введіть назву товару:")
+            return True
+        state["name"] = text
+        state["step"] = "admin_add_price"
+        bot.send_message(user_id, "Введіть ціну товару в гривнях:")
+        return True
+
+    if step == "admin_add_price":
+        try:
+            price = float(text.replace(",", "."))
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            bot.send_message(user_id, "⚠️ Ціна має бути додатним числом. Спробуйте ще раз:")
+            return True
+        state["price"] = price
+        state["step"] = "admin_add_category"
+        bot.send_message(user_id, "Оберіть категорію товару:", reply_markup=category_picker_markup())
+        return True
+
+    if step == "admin_add_category":
+        bot.send_message(user_id, "Оберіть категорію кнопкою під попереднім повідомленням.")
+        return True
+
+    if step == "admin_add_category_name":
+        if not text:
+            bot.send_message(user_id, "⚠️ Назва категорії не може бути порожньою. Спробуйте ще раз:")
+            return True
+        cat_id = generate_category_id(text)
+        try:
+            with sqlite3.connect("pinkcanna.db") as conn:
+                c = conn.cursor()
+                c.execute("INSERT INTO categories (cat_id, name) VALUES (?, ?)", (cat_id, text))
+                conn.commit()
+            load_products_from_db()
+        except sqlite3.Error as e:
+            print("❌ ADMIN ADD CATEGORY:", e)
+            bot.send_message(user_id, "⚠️ Не вдалося створити категорію. Введіть іншу назву:")
+            return True
+        state["category"] = cat_id
+        state["step"] = "admin_add_short"
+        bot.send_message(user_id, f"✅ Категорію «{text}» створено.")
+        prompt_admin_short(user_id)
+        return True
+
+    if step == "admin_add_short":
+        if not text:
+            bot.send_message(user_id, "⚠️ Короткий опис не може бути порожнім. Спробуйте ще раз:")
+            return True
+        state["short"] = text
+        state["step"] = "admin_add_info"
+        bot.send_message(user_id, "Введіть детальний опис товару (можна використовувати HTML/Markdown):")
+        return True
+
+    if step == "admin_add_info":
+        if not text:
+            bot.send_message(user_id, "⚠️ Детальний опис не може бути порожнім. Спробуйте ще раз:")
+            return True
+        state["info"] = text
+        state["step"] = "admin_add_image"
+        prompt_admin_image(user_id)
+        return True
+
+    if step == "admin_add_image":
+        bot.send_message(
+            user_id,
+            "Надішліть фото як зображення або натисніть кнопку пропуску.",
+            reply_markup=image_skip_markup()
+        )
+        return True
+
+    if step == "admin_stock_qty":
+        try:
+            qty = int(text)
+            if qty < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            bot.send_message(user_id, "⚠️ Введіть ціле невід’ємне число:")
+            return True
+        key = state.get("product_key")
+        if key not in PRODUCTS:
+            user_data_cache.pop(user_id, None)
+            bot.send_message(user_id, "⚠️ Товар більше не існує.", reply_markup=admin_menu_markup())
+            return True
+        db_set_stock(key, qty)
+        user_data_cache.pop(user_id, None)
+        bot.send_message(user_id, f"✅ Залишок «{PRODUCTS[key]['name']}» оновлено: {qty} шт.", reply_markup=admin_menu_markup())
+        return True
+
+    if step == "admin_broadcast_content":
+        if not text:
+            bot.send_message(user_id, "⚠️ Текст розсилки не може бути порожнім.")
+            return True
+        show_broadcast_preview(user_id, {"type": "text", "text": message.text})
+        return True
+
+    if step == "admin_broadcast_preview":
+        bot.send_message(user_id, "Підтвердьте або скасуйте розсилку кнопками під попереднім переглядом.")
+        return True
+
+    return False
 
 # --- ОБРОБНИК ТЕКСТУ ТА РЕЄСТРАЦІЯ ---
 @bot.message_handler(func=lambda m: True)
 def handle_all_text(message):
     user_id = message.chat.id
     text = message.text
+
+    if handle_admin_text_input(message):
+        return
 
     if user_id in user_data_cache and 'step' in user_data_cache[user_id]:
         state = user_data_cache[user_id]
@@ -890,4 +1462,3 @@ def handle_all_text(message):
 
 if __name__ == "__main__":
     bot.infinity_polling()
-
